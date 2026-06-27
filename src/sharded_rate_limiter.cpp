@@ -1,6 +1,6 @@
 #include "sharded_rate_limiter.h"
 
-#include <functional>
+#include <functional> // for hasher object in shardedIndexFor
 
 namespace ratelimiter {
 

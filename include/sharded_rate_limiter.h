@@ -20,9 +20,9 @@ namespace ratelimiter {
 // num_shards means two requests for different clients usually land in
 // different shards and never contend for the same lock.
 
-class SharedRateLimiter {
+class ShardedRateLimiter {
  public:
-  SharedRateLimiter(double capacity, double refill_rate_per_sec,
+  ShardedRateLimiter(double capacity, double refill_rate_per_sec,
                      size_t num_shards = 16);
   // Looks up (or lazily creates) the bucket for `key` and attempts to
   // acquire `tokens` from it
