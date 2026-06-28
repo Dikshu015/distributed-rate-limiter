@@ -3,10 +3,12 @@
 #include <string>
 #include <memory>
 
-namespace sw {
-namespace redis {
-class Redis;
-}
+namespace sw
+{
+    namespace redis
+    {
+        class Redis;
+    }
 }
 
 /**
@@ -19,13 +21,14 @@ class Redis;
  * atomically server-side via a Lua script, avoiding race conditions that
  * would occur if refill/check/decrement were sent as separate round trips.
  */
-class RedisBackend {
+class RedisBackend
+{
 public:
     /**
      * @brief Connects to Redis and prepares the rate limiting script.
      * @param connection_uri Redis connection string, e.g. "tcp://127.0.0.1:6379".
      */
-    explicit RedisBackend(const std::string& connection_uri);
+    explicit RedisBackend(const std::string &connection_uri);
 
     /**
      * @brief Closes the Redis connection. Defined in the .cpp file since
@@ -34,8 +37,8 @@ public:
      */
     ~RedisBackend();
 
-    RedisBackend(const RedisBackend&) = delete;
-    RedisBackend& operator=(const RedisBackend&) = delete;
+    RedisBackend(const RedisBackend &) = delete;
+    RedisBackend &operator=(const RedisBackend &) = delete;
 
     /**
      * @brief Attempts to consume one token for the given client key.
@@ -50,7 +53,7 @@ public:
      * @return true if a token was successfully consumed, false if the
      *         bucket was empty (request should be rejected/throttled).
      */
-    bool tryAcquire(const std::string& key, long capacity, double refill_rate);
+    bool tryAcquire(const std::string &key, long capacity, double refill_rate);
 
 private:
     /**
