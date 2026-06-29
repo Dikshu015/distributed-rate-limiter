@@ -2,9 +2,9 @@ build/
 *.o
 *.obj
 *.exe
-*.cache/
+.cache/
 compile_commands.json
 .vscode/
 .idea/
-*.log0md_files_for_reading/
-build/
+*.log
+0md_files_for_reading/
