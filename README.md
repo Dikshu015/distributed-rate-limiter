@@ -1,17 +1,119 @@
+# Distributed Rate Limiter
+
+A rate limiter built in C++17, progressing through five layers of
+increasing coordination complexity: a single-threaded token-bucket
+algorithm, a mutex-protected version of it, a sharded version to reduce
+lock contention, a Redis-backed version for coordination across
+multiple processes, and a leader election layer for designating a
+single coordinator among several running nodes.
+
+Each layer was built, compiled, and tested in isolation before the next
+was added. Every number in this README is from an actual run on real
+hardware, not an estimate.
+
+## Architecture
+
+| Layer | Files | Solves |
+|---|---|---|
+| Algorithm | `token_bucket.h/.cpp` | Token-bucket refill and consumption logic, single-threaded |
+| Thread safety | `thread_safe_token_bucket.h/.cpp` | Safe concurrent access from multiple threads in one process |
+| Sharding | `sharded_rate_limiter.h/.cpp` | Reduced lock contention across many distinct client keys |
+| Distributed state | `redis_backend.h/.cpp`, `scripts/token_bucket.lua` | Shared rate limit state across multiple processes/machines via Redis |
+| Coordination | `leader_elector.h/.cpp`, `scripts/leader_renew.lua` | Electing a single leader among several running nodes, with fencing-safe renewal |
+
+## Building
+
+Requires a C++17 compiler, CMake, and Redis running locally.
+
+### Windows (MSYS2)
+
+See `scripts/setup_windows.sh` for the full toolchain and Redis setup.
+In short: install the MSYS2 UCRT64 toolchain, `hiredis` and
+`redis-plus-plus` via pacman, CMake, and run Redis via Docker
+(`redis:7-alpine`). Build and run from the MSYS2 UCRT64 terminal —
+other MSYS2 sub-environments are known to fail at the linking step on
+this setup.
+
+### Build
+
+```bash
+mkdir -p build && cd build
+cmake .. -G "MinGW Makefiles"
+cmake --build .
+cd ..
+```
+
+This produces four targets in `build/`: `server`, `bench`,
+`bench_contention`, and the `ratelimiter` static library they all link
+against.
+
+### Running
+
+`server.exe` must be run from the project root, not from `build/`,
+since it loads `scripts/token_bucket.lua` and `scripts/leader_renew.lua`
+using paths relative to the working directory:
+
+```bash
+./build/server.exe node_A
+```
+
+## Correctness Verification
+
+Before any performance numbers are meaningful, correctness was verified
+under real concurrent load — not just read and assumed.
+
+**Single-bucket contention** (`tests/manual_stress_test.cpp`): 16
+threads, 50 attempts each (800 total), against a bucket with capacity
+100 and refill rate 0 (no refill, so any deviation from exactly 100
+successful grants is unambiguous evidence of a race):
+
+```
+successful_count = 100 (capacity = 100)
+```
+
+**Multi-key isolation under sharding**
+(`tests/manual_multi_key_stress_test.cpp`): 20 distinct client keys, 4
+threads per key, across only 16 shards — guaranteeing some keys hash to
+the same shard. Every key independently received exactly its entitled
+capacity of 10, with zero cross-contamination between keys sharing a
+shard:
+
+```
+user_0: 10 grants (expected 10)
+user_1: 10 grants (expected 10)
+...
+user_19: 10 grants (expected 10)
+PASS: every key independently received exactly its capacity.
+```
+
+**Redis Lua script, full lifecycle** — three sequential `redis-cli
+--eval` calls against the same key, capacity=10, refill_rate=1,
+timestamp frozen (no refill noise):
+
+| Call | Requested | Tokens before | Result | Tokens after |
+|---|---|---|---|---|
+| 1 | 1 | 10 | allowed | 9 |
+| 2 | 9 | 9 | allowed (exact boundary) | 0 |
+| 3 | 1 | 0 | denied | 0 |
+
+This confirms state genuinely persists in Redis between separate
+process invocations, and both the exact-boundary-allowed case and the
+exhaustion-denied case behave correctly.
+
 ## Benchmark Results
 
-Two separate benchmarks were run to test sharding under different
-conditions: a cheap critical section (`bench_main.cpp`, in-memory token
-math only) and an artificially expensive one (`bench_contention_main.cpp`,
-simulating a network round-trip like a Redis call). Measured on [your
-CPU model].
+Two separate benchmarks test sharding under different conditions: a
+cheap critical section (`bench_main.cpp`, in-memory token math only)
+and an artificially expensive one (`bench_contention_main.cpp`,
+simulating a 500-microsecond network round-trip like a Redis call).
 
 ### Cheap critical section (in-memory token math)
 
-Comparing a single global lock (`ThreadSafeTokenBucket`) against
-`ShardedRateLimiter` at varying shard counts:
+Single global lock (`ThreadSafeTokenBucket`) vs. `ShardedRateLimiter`
+at varying shard counts:
 
 **16 threads, 50,000 requests/thread, 1,000 distinct keys:**
+
 | Configuration | Time | vs. single lock |
 |---|---|---|
 | Single global lock | 147.97 ms | baseline |
@@ -21,6 +123,7 @@ Comparing a single global lock (`ThreadSafeTokenBucket`) against
 | Sharded, 64 shards | 210.65 ms | 0.70x |
 
 **64 threads, 50,000 requests/thread, 1,000 distinct keys:**
+
 | Configuration | Time | vs. single lock |
 |---|---|---|
 | Single global lock | 524.65 ms | baseline |
@@ -41,9 +144,10 @@ benefit, explaining the ~5x regression visible there.
 
 Same comparison, but each call now holds its lock for a simulated
 500-microsecond delay — standing in for something like a Redis
-round-trip, which is orders of magnitude slower than in-memory math:
+round-trip, orders of magnitude slower than in-memory math:
 
 **16 threads, 200 requests/thread, 1,000 distinct keys, 500us simulated work:**
+
 | Configuration | Time | vs. single lock |
 |---|---|---|
 | Single global lock | 1610.26 ms | baseline |
@@ -74,3 +178,78 @@ system's critical section also includes a Redis round-trip (see
 `RedisBackend`), which is far closer in cost to the simulated 500us
 delay than to the near-instant in-memory case — exactly the regime
 where this benchmark shows sharding paying off.
+
+Reproduce these numbers:
+
+```bash
+./build/bench.exe 16 50000 1000
+./build/bench.exe 64 50000 1000
+./build/bench_contention.exe 16 200 1000 500
+```
+
+## Distributed Leader Election
+
+`LeaderElector` uses a Redis key (`SET key value NX EX ttl`) as a
+lease-based lock. Acquisition is a single atomic Redis command, so
+there is no race even if two nodes attempt it at the exact same
+instant — Redis processes commands one at a time, and exactly one
+`SET ... NX` can ever succeed against an absent key.
+
+Renewal is harder: a leader must extend its lease before the TTL
+expires, but a naive renewal could let a node that has already lost
+leadership (e.g. after a long pause) overwrite a new leader's lease.
+This is fixed with a check-and-set Lua script
+(`scripts/leader_renew.lua`) that only extends the TTL if the caller's
+lease token still matches what is stored in Redis.
+
+### Verified failover
+
+Two server processes (`node_A`, `node_B`) were run concurrently against
+the same Redis instance and the same election key, with a 3-second
+lease TTL. Wall-clock timestamps from the actual run:
+
+```
+[node_A] 22:12:10 (t=0s):   ACQUIRED leadership
+[node_A] 22:12:11 (t=1s):   renewed (still leader)
+...
+[node_A] 22:12:30 (t=19s):  renewed (still leader)
+[node_A] -- process killed (Ctrl+C) --
+
+[node_B] 22:12:33 (t=15s):  ACQUIRED leadership
+[node_B] 22:12:34 (t=16s):  renewed (still leader)
+...
+```
+
+node_B acquired leadership 3 seconds after node_A's last confirmed
+renewal — exactly matching the configured TTL, with no overlap and no
+gap longer than one lease cycle.
+
+Reproduce this:
+
+```bash
+# Terminal 1
+./build/server.exe node_A
+
+# Terminal 2 (within a few seconds)
+./build/server.exe node_B
+```
+
+Kill node_A's process (Ctrl+C) and watch node_B's terminal — it should
+log `ACQUIRED leadership` within one TTL window (a few seconds).
+
+## Known Limitations
+
+- **Relative file paths.** `RedisBackend` and `LeaderElector` load their
+  Lua scripts using paths relative to the current working directory
+  (`scripts/token_bucket.lua`), not relative to the executable's
+  location. The binaries must be run from the project root. A more
+  robust version would embed the scripts as string literals at compile
+  time or resolve paths relative to the executable.
+- **No automated test runner.** Correctness is verified by standalone
+  `tests/manual_*.cpp` programs with plain assertions and printed
+  output, run by hand, rather than a GoogleTest suite wired into CMake.
+  Each test's expected output is documented above and in the test files
+  themselves.
+- **Fixed TTLs and shard counts in the demo binaries.** `server_main.cpp`
+  uses hardcoded capacity, refill rate, and lease TTL values for
+  demonstration; a production deployment would make these configurable.
