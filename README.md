@@ -204,9 +204,10 @@ lease token still matches what is stored in Redis.
 
 ### Verified failover
 
-Two server processes (`node_A`, `node_B`) were run concurrently against
-the same Redis instance and the same election key, with a 3-second
-lease TTL. Wall-clock timestamps from the actual run:
+Two instances of `tests/manual_leader_election_test.cpp` were run
+concurrently against the same Redis instance and the same election
+key, with a 3-second lease TTL. Wall-clock timestamps from the actual
+run:
 
 ```
 [node_A] 22:12:10 (t=0s):   ACQUIRED leadership
@@ -224,18 +225,27 @@ node_B acquired leadership 3 seconds after node_A's last confirmed
 renewal — exactly matching the configured TTL, with no overlap and no
 gap longer than one lease cycle.
 
-Reproduce this:
+Reproduce this (`manual_leader_election_test.cpp` is not yet a CMake
+target — build it directly):
 
 ```bash
+g++ -std=c++17 -Iinclude src/leader_elector.cpp tests/manual_leader_election_test.cpp -o leader_test -lredis++ -lhiredis -lws2_32
+
 # Terminal 1
-./build/server.exe node_A
+./leader_test.exe node_A 120
 
 # Terminal 2 (within a few seconds)
-./build/server.exe node_B
+./leader_test.exe node_B 120
 ```
 
 Kill node_A's process (Ctrl+C) and watch node_B's terminal — it should
-log `ACQUIRED leadership` within one TTL window (a few seconds).
+log `ACQUIRED leadership` within one TTL window (3 seconds, as
+configured in the test file).
+
+`server.exe` (built via CMake, see Building above) also runs
+`LeaderElector` continuously as part of its main loop, using a
+10-second TTL, but logs leadership status inline with rate-limit
+decisions rather than in the dedicated format shown above.
 
 ## Known Limitations
 
@@ -245,11 +255,17 @@ log `ACQUIRED leadership` within one TTL window (a few seconds).
   location. The binaries must be run from the project root. A more
   robust version would embed the scripts as string literals at compile
   time or resolve paths relative to the executable.
-- **No automated test runner.** Correctness is verified by standalone
-  `tests/manual_*.cpp` programs with plain assertions and printed
-  output, run by hand, rather than a GoogleTest suite wired into CMake.
-  Each test's expected output is documented above and in the test files
-  themselves.
+- **No automated test runner, and no test files wired into CMake.**
+  Correctness is verified by standalone programs in `tests/`, each
+  compiled and run by hand rather than through a GoogleTest suite:
+  `manual_stress_test.cpp` (single-bucket contention),
+  `manual_multi_key_stress_test.cpp` (sharded multi-key isolation),
+  `manual_leader_election_test.cpp` (failover timing),
+  `manual_redis_backend_test.cpp` and `redis_smoke_test.cpp` (Redis
+  connectivity and backend behavior), plus two header-only compile
+  checks (`leader_elector_header_check.cpp`,
+  `redis_backend_header_check.cpp`). Expected output for each is
+  documented above and in the files themselves.
 - **Fixed TTLs and shard counts in the demo binaries.** `server_main.cpp`
   uses hardcoded capacity, refill rate, and lease TTL values for
   demonstration; a production deployment would make these configurable.
