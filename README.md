@@ -13,13 +13,24 @@ hardware, not an estimate.
 
 ## Architecture
 
-| Layer | Files | Solves |
-|---|---|---|
-| Algorithm | `token_bucket.h/.cpp` | Token-bucket refill and consumption logic, single-threaded |
-| Thread safety | `thread_safe_token_bucket.h/.cpp` | Safe concurrent access from multiple threads in one process |
-| Sharding | `sharded_rate_limiter.h/.cpp` | Reduced lock contention across many distinct client keys |
-| Distributed state | `redis_backend.h/.cpp`, `scripts/token_bucket.lua` | Shared rate limit state across multiple processes/machines via Redis |
-| Coordination | `leader_elector.h/.cpp`, `scripts/leader_renew.lua` | Electing a single leader among several running nodes, with fencing-safe renewal |
+```
+        ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+        │  Node A      │     │  Node B      │     │  Node C      │
+        │ (this app)   │     │ (this app)   │     │ (this app)   │
+        │              │     │              │     │              │
+        │ LocalCache   │     │ LocalCache   │     │ LocalCache   │
+        │ (mutex/cv)   │     │ (mutex/cv)   │     │ (mutex/cv)   │
+        └──────┬───────┘     └──────┬───────┘     └──────┬───────┘
+               │                    │                    │
+               └────────────────────┼────────────────────┘
+                                    │
+                            ┌───────▼────────┐
+                            │     Redis      │
+                            │ (shared state, │
+                            │  Lua script    │
+                            │  for atomicity) │
+                            └────────────────┘
+```
 
 ## Building
 

@@ -42,3 +42,6 @@ target_link_libraries(bench PRIVATE ratelimiter)
 
 add_executable(bench_contention src/bench_contention_main.cpp)
 target_link_libraries(bench_contention PRIVATE Threads::Threads)
+
+enable_testing()
+add_subdirectory(tests)

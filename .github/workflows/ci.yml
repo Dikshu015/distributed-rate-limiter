@@ -1,0 +1,137 @@
+name: CI
+
+# Runs on every push and PR. Two real jobs, not one: "stub" builds and
+# tests the project WITHOUT redis-plus-plus installed (exercising the
+# HAVE_REDIS=0 code paths in redis_backend.cpp / leader_elector.cpp —
+# see their #else branches), and "full" builds with redis-plus-plus and
+# a live Redis service container, exercising the actual distributed
+# coordination paths. Keeping both matters: "stub" catches regressions
+# in the fallback behavior itself (the kind of thing that's easy to
+# silently break since most local dev happens with Redis available),
+# and it's fast — useful as a quick smoke signal before "full" finishes.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  stub-build:
+    name: Build & test (no Redis — stub mode)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Run unit tests
+        working-directory: build
+        run: ctest --output-on-failure
+
+  full-build:
+    name: Build & test (with Redis)
+    runs-on: ubuntu-latest
+
+    # GitHub Actions service containers — a real Redis instance,
+    # network-reachable from the job at redis:6379, no manual install
+    # or daemonize step needed. This is the same Redis your own
+    # scripts/setup.sh starts locally, just provisioned by the CI
+    # platform instead.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools and hiredis
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libhiredis-dev git
+
+      - name: Cache redis-plus-plus build
+        id: cache-redis-plus-plus
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/lib/libredis++*
+          key: redis-plus-plus-${{ runner.os }}-v1
+
+      - name: Build & install redis-plus-plus
+        if: steps.cache-redis-plus-plus.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://github.com/sewenew/redis-plus-plus.git /tmp/redis-plus-plus
+          cmake -S /tmp/redis-plus-plus -B /tmp/redis-plus-plus/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/redis-plus-plus/build -j"$(nproc)"
+          sudo cmake --install /tmp/redis-plus-plus/build
+          sudo ldconfig
+
+      - name: Verify Redis service is reachable
+        run: redis-cli -h localhost -p 6379 ping
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Run unit tests
+        working-directory: build
+        run: ctest --output-on-failure
+
+      - name: Smoke-test the live server against the running Redis
+        run: |
+          ./build/server tcp://localhost:6379 8080 &
+          SERVER_PID=$!
+          sleep 1
+          # First request should be allowed (bucket starts full).
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8080/allow?key=ci_smoke_test")
+          echo "First request status: $STATUS"
+          test "$STATUS" = "200"
+          kill $SERVER_PID
+
+  thread-sanitizer:
+    name: ThreadSanitizer (race detection)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake clang
+
+      # TSan run deliberately skips Redis — it's here to catch races in
+      # the IN-PROCESS concurrency primitives (TokenBucket,
+      # ThreadSafeTokenBucket, ShardedRateLimiter, LeaderElector's local
+      # state machine), which is exactly the surface a regression is
+      # most likely to hit silently. This job is what makes "verified
+      # with ThreadSanitizer" a true, ongoing claim about the repo, not
+      # a one-time finding documented in NOTES.md and never checked again.
+      - name: Configure with ThreadSanitizer
+        run: cmake -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DUSE_TSAN=ON
+        env:
+          CC: clang
+          CXX: clang++
+
+      - name: Build
+        run: cmake --build build-tsan -j"$(nproc)"
+
+      - name: Run unit tests under ThreadSanitizer
+        working-directory: build-tsan
+        run: ctest --output-on-failure
