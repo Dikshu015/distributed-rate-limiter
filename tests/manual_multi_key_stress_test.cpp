@@ -24,7 +24,7 @@ int main(){
     for (int k=0; k < num_keys; ++k){
         std::string key = "user_" + std::to_string(k);
         for (int t=0; t < threads_per_key; ++t){
-            threads.emplace_back([&limiter, key, &success_counts, k](){
+            threads.emplace_back([&limiter, key, &success_counts, k, attempts_per_thread](){
                 for (int i=0; i<attempts_per_thread;++i){
                     if (limiter.tryAcquire(key)){
                         success_counts[k].fetch_add(1,std::memory_order_relaxed);
