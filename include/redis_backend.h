@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <mutex>
 #include <memory>
 
 namespace sw
@@ -63,7 +64,10 @@ private:
      * @return The script's SHA1 hash.
      */
     std::string loadScriptSha();
+    std::string loadScriptText() const;
 
     std::unique_ptr<sw::redis::Redis> redis_;
     std::string script_sha_;
+    std::string script_text_;
+    mutable std::mutex script_mutex_;
 };
