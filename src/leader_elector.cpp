@@ -2,6 +2,7 @@
 
 #include <sw/redis++/redis++.h>
 
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <random>
@@ -45,7 +46,18 @@ LeaderElector::LeaderElector(const std::string& connection_uri,
       node_id_(node_id),
       ttl_seconds_(ttl_seconds),
       is_leader_(false) {
-  std::string script = loadScriptFromFile("scripts/leader_renew.lua");
+  if (node_id_.empty()) {
+    throw std::invalid_argument("LeaderElector: node_id must not be empty");
+  }
+  if (ttl_seconds_ <= 0) {
+    throw std::invalid_argument("LeaderElector: ttl_seconds must be > 0");
+  }
+
+  const char* script_dir = std::getenv("RATE_LIMITER_SCRIPT_DIR");
+  const std::string directory =
+      (script_dir && *script_dir) ? script_dir : "scripts";
+  std::string script =
+      loadScriptFromFile(directory + "/leader_renew.lua");
   renew_script_sha_ = redis_->script_load(script);
 }
 
