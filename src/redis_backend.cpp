@@ -3,79 +3,91 @@
 #include <sw/redis++/redis++.h>
 
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
 
-/**
- * @brief Constructs a RedisBackend, connects to Redis, and loads the
- * rate limiting script.
- *
- * If script loading fails (e.g. Redis unreachable, or the script file
- * is missing), this throws — a RedisBackend that can't load its script
- * is not in a usable state, so failing fast at construction is better
- * than discovering the problem on the first real request.
- */
-RedisBackend::RedisBackend(const std::string& connection_uri)
-    : redis_(std::make_unique<sw::redis::Redis>(connection_uri)) {
-    script_sha_ = loadScriptSha();
+namespace {
+
+std::string scriptDirectory() {
+    const char* value = std::getenv("RATE_LIMITER_SCRIPT_DIR");
+    return value && *value ? value : "scripts";
 }
 
-/**
- * @brief Destructor. Defined here (not defaulted in the header) because
- * sw::redis::Redis's full definition must be visible to generate the
- * unique_ptr's deletion logic correctly.
- */
-RedisBackend::~RedisBackend() = default;
-
-/**
- * @brief Reads scripts/token_bucket.lua from disk and registers it with
- * Redis via SCRIPT LOAD, returning the SHA1 hash Redis assigns it.
- *
- * @throws std::runtime_error if the script file cannot be read.
- */
-std::string RedisBackend::loadScriptSha() {
-    std::ifstream file("scripts/token_bucket.lua");
+std::string readFile(const std::string& path) {
+    std::ifstream file(path);
     if (!file.is_open()) {
         throw std::runtime_error(
-            "RedisBackend: could not open scripts/token_bucket.lua "
-            "(check that the program is run from the project root)");
+            "RedisBackend: could not open " + path +
+            ". Set RATE_LIMITER_SCRIPT_DIR or run from the project root.");
     }
 
     std::ostringstream buffer;
     buffer << file.rdbuf();
-    std::string script = buffer.str();
-
-    return redis_->script_load(script);
+    return buffer.str();
 }
 
-/**
- * @brief Attempts to consume one token for the given client key by
- * calling the cached Lua script via EVALSHA.
- *
- * Fails closed: if Redis is unreachable or the call otherwise throws,
- * this returns false (denies the request) rather than propagating the
- * exception. During an outage, rejecting traffic is usually safer than
- * letting it through unchecked.
- */
+}  // namespace
+
+RedisBackend::RedisBackend(const std::string& connection_uri)
+    : redis_(std::make_unique<sw::redis::Redis>(connection_uri)),
+      script_text_(loadScriptText()) {
+    script_sha_ = redis_->script_load(script_text_);
+}
+
+RedisBackend::~RedisBackend() = default;
+
+std::string RedisBackend::loadScriptText() const {
+    return readFile(scriptDirectory() + "/token_bucket.lua");
+}
+
+std::string RedisBackend::loadScriptSha() {
+    script_text_ = loadScriptText();
+    return redis_->script_load(script_text_);
+}
+
 bool RedisBackend::tryAcquire(const std::string& key, long capacity,
-                               double refill_rate) {
-    double now = std::chrono::duration<double>(
-                     std::chrono::system_clock::now().time_since_epoch())
-                     .count();
+                              double refill_rate) {
+    if (key.empty() || capacity <= 0 || !std::isfinite(refill_rate) ||
+        refill_rate < 0.0) {
+        return false;
+    }
 
     try {
         long long allowed = redis_->evalsha<long long>(
             script_sha_,
             {key},
-            {std::to_string(capacity), std::to_string(refill_rate),
-             std::to_string(now)});
-
+            {std::to_string(capacity), std::to_string(refill_rate)});
         return allowed == 1;
     } catch (const sw::redis::Error& e) {
-        std::cerr << "RedisBackend::tryAcquire failed, denying request: "
-                  << e.what() << std::endl;
-        return false;
+        // Redis can lose loaded scripts after a restart/failover. Retry only
+        // for the explicit NOSCRIPT case; retrying arbitrary connection errors
+        // could duplicate a request whose first execution actually succeeded.
+        const std::string message = e.what();
+        if (message.find("NOSCRIPT") == std::string::npos) {
+            std::cerr << "RedisBackend::tryAcquire failed, denying request: "
+                      << message << '\n';
+            return false;
+        }
+
+        try {
+            std::lock_guard<std::mutex> lock(script_mutex_);
+            // Another thread may already have restored the script. Reloading
+            // is harmless and keeps recovery simple and deterministic.
+            script_sha_ = loadScriptSha();
+            long long allowed = redis_->evalsha<long long>(
+                script_sha_,
+                {key},
+                {std::to_string(capacity), std::to_string(refill_rate)});
+            return allowed == 1;
+        } catch (const sw::redis::Error& retry_error) {
+            std::cerr << "RedisBackend::tryAcquire NOSCRIPT recovery failed, "
+                         "denying request: "
+                      << retry_error.what() << '\n';
+            return false;
+        }
     }
 }
