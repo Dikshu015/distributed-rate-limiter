@@ -3,43 +3,54 @@
 #include <thread>
 
 #include <gtest/gtest.h>
+#include <sw/redis++/redis++.h>
 
 #include "redis_backend.h"
 
-// These tests require a live Redis instance at tcp://127.0.0.1:6379.
-// In CI, this is provided by a Redis service container.
-// Locally: docker start redis-dev
-
 static const std::string kRedisUri = "tcp://127.0.0.1:6379";
 
-TEST(RedisBackend, AllowsRequestsWithinCapacity) {
-  RedisBackend backend(kRedisUri);
-  const std::string key = "test:redis_backend:within_capacity";
+class RedisBackendTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    sw::redis::Redis redis(kRedisUri);
+    key_ = "test:redis_backend:" +
+           std::to_string(std::chrono::steady_clock::now()
+                              .time_since_epoch()
+                              .count());
+    redis.del(key_);
+  }
 
-  EXPECT_TRUE(backend.tryAcquire(key, /*capacity=*/5, /*refill_rate=*/0));
+  void TearDown() override {
+    sw::redis::Redis redis(kRedisUri);
+    redis.del(key_);
+  }
+
+  std::string key_;
+};
+
+TEST_F(RedisBackendTest, AllowsRequestsWithinCapacity) {
+  RedisBackend backend(kRedisUri);
+  EXPECT_TRUE(backend.tryAcquire(key_, 5, 0));
 }
 
-TEST(RedisBackend, DeniesRequestsOnceBucketIsExhausted) {
+TEST_F(RedisBackendTest, DeniesRequestsOnceBucketIsExhausted) {
   RedisBackend backend(kRedisUri);
-  const std::string key = "test:redis_backend:exhausted";
 
   for (int i = 0; i < 5; ++i) {
-    backend.tryAcquire(key, /*capacity=*/5, /*refill_rate=*/0);
+    EXPECT_TRUE(backend.tryAcquire(key_, 5, 0));
   }
 
-  EXPECT_FALSE(backend.tryAcquire(key, /*capacity=*/5, /*refill_rate=*/0));
+  EXPECT_FALSE(backend.tryAcquire(key_, 5, 0));
 }
 
-TEST(RedisBackend, RefillsTokensOverTime) {
+TEST_F(RedisBackendTest, RefillsTokensOverTime) {
   RedisBackend backend(kRedisUri);
-  const std::string key = "test:redis_backend:refill";
 
   for (int i = 0; i < 3; ++i) {
-    backend.tryAcquire(key, /*capacity=*/3, /*refill_rate=*/10);
+    EXPECT_TRUE(backend.tryAcquire(key_, 3, 10));
   }
-  EXPECT_FALSE(backend.tryAcquire(key, /*capacity=*/3, /*refill_rate=*/10));
+  EXPECT_FALSE(backend.tryAcquire(key_, 3, 10));
 
   std::this_thread::sleep_for(std::chrono::milliseconds(150));
-
-  EXPECT_TRUE(backend.tryAcquire(key, /*capacity=*/3, /*refill_rate=*/10));
+  EXPECT_TRUE(backend.tryAcquire(key_, 3, 10));
 }
