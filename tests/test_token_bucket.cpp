@@ -1,6 +1,7 @@
 #include "token_bucket.h"
 
 #include <thread>
+#include <stdexcept>
 
 #include <gtest/gtest.h>
 
