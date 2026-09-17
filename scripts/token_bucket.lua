@@ -1,20 +1,21 @@
--- token_bucket.lua
+-- Atomic token-bucket operation.
 --
--- Atomic refill-check-decrement for a single rate limit key, executed
--- server-side in Redis so concurrent callers from different processes
--- can never race each other on the same bucket.
+-- KEYS[1] = bucket key
+-- ARGV[1] = capacity
+-- ARGV[2] = refill rate (tokens/second)
 --
--- KEYS[1] = bucket key, e.g. "ratelimit:user42"
--- ARGV[1] = capacity (max tokens the bucket can hold)
--- ARGV[2] = refill_rate (tokens added per second)
--- ARGV[3] = now (current unix time in seconds, as a float)
+-- Time comes from Redis itself rather than the client. This prevents two
+-- application processes with different system clocks from calculating
+-- different refill amounts for the same distributed bucket.
 --
--- Returns 1 if a token was acquired, 0 if the bucket was empty.
+-- Returns 1 when one token is consumed, otherwise 0.
 
 local key = KEYS[1]
 local capacity = tonumber(ARGV[1])
 local refill_rate = tonumber(ARGV[2])
-local now = tonumber(ARGV[3])
+
+local server_time = redis.call("TIME")
+local now = tonumber(server_time[1]) + tonumber(server_time[2]) / 1000000
 
 local bucket = redis.call("HMGET", key, "tokens", "last_refill")
 local tokens = tonumber(bucket[1])
@@ -37,7 +38,7 @@ if tokens >= 1 then
     allowed = 1
 end
 
-redis.call("HMSET", key, "tokens", tokens, "last_refill", last_refill)
+redis.call("HSET", key, "tokens", tokens, "last_refill", last_refill)
 redis.call("EXPIRE", key, 3600)
 
 return allowed
